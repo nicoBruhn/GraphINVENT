@@ -38,7 +38,8 @@ class DataProcesser:
 
         # load the molecules
         self.molecule_set = load.molecules(self.path)
-
+        self.n_molecules       = len(self.molecule_set)
+        print(f"-- {self.n_molecules} molecules in set.", flush=True)
         # placeholders
         self.molecule_subset    = None
         self.dataset            = None
@@ -51,9 +52,7 @@ class DataProcesser:
 
         # get total number of molecules, and total number of subgraphs in their
         # decoding routes
-        self.n_molecules       = len(self.molecule_set)
         self.total_n_subgraphs = self.get_n_subgraphs()
-        print(f"-- {self.n_molecules} molecules in set.", flush=True)
         print(f"-- {self.total_n_subgraphs} total subgraphs in set.",
               flush=True)
 
@@ -80,9 +79,8 @@ class DataProcesser:
             # this is where we fill the datasets with actual data by looping
             # over subgraphs in blocks of size `constants.batch_size`
             for idx in range(0, self.total_n_subgraphs, constants.batch_size):
-
+                print(f'IDX: {idx}')
                 if not self.skip_collection:
-
                     self.get_molecule_subset()
 
                     # add `constants.batch_size` subgraphs from
@@ -90,7 +88,7 @@ class DataProcesser:
                     # set, calculate their properties and add these to
                     # `self.ts_properties`)
                     self.get_subgraphs(init_idx=idx)
-
+                    
                     util.write_last_molecule_idx(
                         last_molecule_idx=self.resume_idx,
                         dataset_size=self.dataset_size,
@@ -178,12 +176,12 @@ class DataProcesser:
                              from `self.molecule_subset`.
         """
         data_subgraphs, data_apds, molecular_graph_list = [], [], []  # initialize
+        sub_graphs_hash = {}
 
         # convert all molecules in `self.molecules_subset` to `PreprocessingGraphs`
         molecular_graph_generator = map(self.get_graph, self.molecule_subset)
 
         molecules_processed       = 0  # keep track of the number of molecules processed
-
         # loop over all the `PreprocessingGraph`s
         for graph in molecular_graph_generator:
             molecules_processed += 1
@@ -200,49 +198,43 @@ class DataProcesser:
                 subgraph, apd = graph.get_decoding_route_state(
                     subgraph_idx=new_subgraph_idx
                 )
-
-                # "collect" all APDs corresponding to pre-existing subgraphs,
-                # otherwise append both new subgraph and new APD
-                count = 0
-                for idx, existing_subgraph in enumerate(data_subgraphs):
-
-                    count += 1
-                    # check if subgraph `subgraph` is "already" in
-                    # `data_subgraphs` as `existing_subgraph`, and if so, add
-                    # the "new" APD to the "old"
-                    try:  # first compare the node feature matrices
-                        nodes_equal = (subgraph[0] == existing_subgraph[0]).all()
-                    except AttributeError:
-                        nodes_equal = False
-                    try:  # then compare the edge feature tensors
-                        edges_equal = (subgraph[1] == existing_subgraph[1]).all()
-                    except AttributeError:
-                        edges_equal = False
-
-                    # if both matrices have a match, then subgraphs are the same
-                    if nodes_equal and edges_equal:
-                        existing_apd = data_apds[idx]
-                        existing_apd += apd
-                        break
-
-                # if subgraph is not already in `data_subgraphs`, append it
-                if count == len(data_subgraphs) or count == 0:
+                graph_hash = hash((subgraph[0].tobytes(), subgraph[1].tobytes()))
+                
+                if graph_hash in sub_graphs_hash:
+                    graph_exists = False
+                    for idx in sub_graphs_hash[graph_hash]:
+                        existing_subgraph = data_subgraphs[idx]
+                        try:  # first compare the node feature matrices
+                            nodes_equal = (subgraph[0] == existing_subgraph[0]).all()
+                        except AttributeError:
+                            nodes_equal = False
+                        try:  # then compare the edge feature tensors
+                            edges_equal = (subgraph[1] == existing_subgraph[1]).all()
+                        except AttributeError:
+                            edges_equal = False
+                        if nodes_equal and edges_equal:
+                            existing_apd = data_apds[idx]
+                            existing_apd += apd
+                            graph_exists = True
+                            break
+                    if graph_exists == False:
+                        data_subgraphs.append(subgraph)
+                        data_apds.append(apd)
+                        sub_graphs_hash[graph_hash].append(len(data_subgraphs) - 1)
+                else:
                     data_subgraphs.append(subgraph)
                     data_apds.append(apd)
-
-                # if `constants.batch_size` unique subgraphs have been
-                # processed, save group to the HDF dataset
+                    sub_graphs_hash[graph_hash] = [len(data_subgraphs) - 1]
+                
                 len_data_subgraphs = len(data_subgraphs)
                 if len_data_subgraphs == constants.batch_size:
                     self.save_group(data_subgraphs=data_subgraphs,
                                     data_apds=data_apds,
                                     group_size=len_data_subgraphs,
                                     init_idx=init_idx)
-
                     # get molecular properties for group iff it's the training set
                     self.get_ts_properties(molecular_graphs=molecular_graph_list,
                                            group_size=constants.batch_size)
-
                     # keep track of the last molecule to be processed in
                     # `self.resume_idx`
                     # number of molecules processed:
@@ -266,8 +258,7 @@ class DataProcesser:
 
         # keep track of the last molecule to be processed in `self.resume_idx`
         self.resume_idx   += molecules_processed  # number of molecules processed
-        self.dataset_size += molecules_processed  # subgraphs processed
-
+        self.dataset_size += n_processed_subgraphs# subgraphs processed
         return None
 
     def create_datasets(self, hdf_file : h5py._hl.files.File) -> None:
@@ -347,18 +338,16 @@ class DataProcesser:
         init_idx             = self.resume_idx
         subset_size          = constants.batch_size
         self.molecule_subset = []
-        max_idx              = min(init_idx + subset_size, self.n_molecules)
 
-        count = -1
-        for mol in self.molecule_set:
+        count = 0
+        for i in range(init_idx, self.n_molecules): 
+            mol = self.molecule_set[i]
             if mol is not None:
+                self.molecule_subset.append(mol)
                 count += 1
-                if count < init_idx:
-                    continue
-                elif count >= max_idx:
-                    return self.molecule_subset
-                else:
-                    self.molecule_subset.append(mol)
+                if count >= subset_size:
+                    break
+        return self.molecule_subset
 
     def get_n_subgraphs(self) -> int:
         """
